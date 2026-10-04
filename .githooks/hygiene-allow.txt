@@ -1,0 +1,3 @@
+# Reviewed false positives for the pre-commit hygiene scan, one per line:
+#   <path>|<substring that must appear in the matched line>
+# Both must match for a hit to be dropped. Keep this short and specific.

@@ -1,0 +1,360 @@
+#!/bin/sh
+# Last line of defence before anything reaches the PUBLIC GitHub repo.
+#
+# WHY THIS EXISTS ALONGSIDE pre-commit
+# ------------------------------------
+# pre-commit only sees what is being committed, at the moment it is committed.
+# It does not see:
+#   - commits made with --no-verify (its own documented escape hatch)
+#   - commits made before the hook existed, or on a machine without it
+#   - commits pulled in from a branch or another clone
+# Push is the point of no return: once content is on GitHub it must be treated
+# as public forever, even if deleted afterwards. So the whole range being pushed
+# is re-scanned here, not just one commit's staged diff.
+#
+# Scope is deliberately WIDER than pre-commit: it also blocks live server/infra
+# details and local machine paths, neither of which is secret-shaped enough for
+# pre-commit's key-material patterns to catch, but both of which hand an
+# attacker a starting point and have no business in a public repo.
+#
+# See "REPOSITORY HYGIENE — HARD RULE" in CLAUDE.md for the policy this enforces.
+#
+# Escape hatch (only for a real, reviewed false positive): git push --no-verify
+
+REMOTE_REF_BASE=""
+FAIL=0
+
+# stdin gives: <local ref> <local sha> <remote ref> <remote sha>
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  # Deleting a ref — nothing to scan.
+  case "$local_sha" in
+    *[!0]*) ;;
+    *) continue ;;
+  esac
+
+  if [ -z "${remote_sha##*[!0]*}" ]; then
+    RANGE="$remote_sha..$local_sha"
+  else
+    # New branch with no remote counterpart — scan against the default branch
+    # so we review only what this branch actually adds.
+    BASE=$(git merge-base origin/main "$local_sha" 2>/dev/null)
+    if [ -n "$BASE" ]; then
+      RANGE="$BASE..$local_sha"
+    else
+      RANGE="$local_sha"
+    fi
+  fi
+  REMOTE_REF_BASE="$REMOTE_REF_BASE $RANGE"
+done
+
+[ -z "$REMOTE_REF_BASE" ] && exit 0
+
+# The ID shapes, the allowlist that keeps them usable, and the two
+# doc-specific patterns all live in one file both hooks read.
+. "$(dirname "$0")/id-patterns.sh"
+
+# Literal terms -- this project's own account names, host names, ports and
+# usernames -- are NOT written in this file, because this file is tracked and
+# public: a hook that names the thing it guards is itself the leak. They live
+# in the gitignored local/hygiene-deny.txt, one extended regex a line, and
+# are read here when that file exists. A clone without it still runs every
+# shape-based check below; only the literal check is absent there.
+DENY_FILE="$(git rev-parse --show-toplevel 2>/dev/null)/local/hygiene-deny.txt"
+DENY_LITERALS=""
+if [ -f "$DENY_FILE" ]; then
+  DENY_LITERALS=$(tr -d '\r' < "$DENY_FILE" | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' | paste -sd '|' -)
+fi
+
+for RANGE in $REMOTE_REF_BASE; do
+  # .githooks/ is excluded from the SHAPE checks because the hooks necessarily
+  # spell out the shapes they block, and a shape is not a leak. A literal is,
+  # which is why the literal terms live in local/hygiene-deny.txt rather than
+  # here, and why the literal check below reads the hooks too: a hook can
+  # guard a name without containing it. Commit messages are scanned in full.
+  # ADDED lines only. The hook gates what ENTERS the repo, and a full unified
+  # diff also carries the removed lines -- so a commit whose whole purpose is to
+  # DELETE a leak would match its own removals and be refused, making the one
+  # commit that fixes a leak the one commit that cannot be pushed. Removing
+  # something already public can never make it more public.
+  DIFF=$(git diff "$RANGE" -- . ':(exclude).githooks/' 2>/dev/null | grep '^+' | grep -v '^+++')
+  DIFF_ALL=$(git diff "$RANGE" 2>/dev/null | grep '^+' | grep -v '^+++')
+  MSGS=$(git log --format='%B' "$RANGE" 2>/dev/null)
+  [ -z "$DIFF" ] && [ -z "$MSGS" ] && continue
+
+  # Content AND commit messages are both in scope — the hygiene rule covers
+  # "not in a doc, not in a code comment, not in a commit message".
+  BOTH=$(printf '%s\n%s\n' "$DIFF" "$MSGS")
+
+  # A third argument of "case" makes the match case-sensitive. Tracker IDs are
+  # always upper-case; matched case-insensitively, the T-AUDIT shape also hit
+  # ordinary prose such as "can't-do-this".
+  check() {
+    label="$1"
+    pattern="$2"
+    flags="-nEi"
+    [ "${3:-}" = "case" ] && flags="-nE"
+    hits=$(printf '%s\n' "$BOTH" | grep $flags "$pattern" | head -5)
+    if [ -n "$hits" ]; then
+      echo "BLOCKED [$label] in $RANGE:"
+      echo "$hits" | cut -c1-160
+      echo ""
+      FAIL=1
+    fi
+  }
+
+  check "private key material" \
+    "BEGIN [A-Z ]*PRIVATE KEY|xprv[0-9A-Za-z]{50,}|ed25519_sk1[0-9a-z]{50,}"
+
+  check "mnemonic / seed phrase" \
+    "(mnemonic|seed[_ ]phrase)[[:space:]]*[:=][[:space:]]*[\"'][a-z ]{20,}[\"']"
+
+  check "API key or token with a real-looking value" \
+    "(api[_-]?key|apikey|auth[_-]?token|access[_-]?token|client[_-]?secret|project_id|password)[[:space:]]*[:=][[:space:]]*[\"'][A-Za-z0-9_/+-]{16,}[\"']"
+
+  check "GitHub / cloud credential" \
+    "ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|sk_live_[0-9A-Za-z]{10,}"
+
+  # Shapes, never names: any home directory, a Windows user path with either
+  # slash, a numbered host, cPanel's own words. The names themselves are the
+  # literal check that follows.
+  check "live server / hosting detail" \
+    "cpanel[[:space:]]*(user|password)|server[0-9]{2,4}\b|/home/[A-Za-z0-9_-]+/(public_html|lscache)"
+
+  check "local machine path" \
+    "C:[\\\\/]+Users[\\\\/]+[A-Za-z]|/home/[A-Za-z0-9_-]+|/mnt/c/Users|AppData[\\\\/]+Local[\\\\/]+Temp"
+
+  if [ -n "$DENY_LITERALS" ]; then
+    hits=$(printf '%s\n%s\n' "$DIFF_ALL" "$MSGS" | grep -nEi "$DENY_LITERALS" | head -5)
+    if [ -n "$hits" ]; then
+      echo "BLOCKED [a term listed in local/hygiene-deny.txt] in $RANGE:"
+      echo "$hits" | cut -c1-160
+      echo ""
+      FAIL=1
+    fi
+  fi
+
+  # Tracker IDs and security-audit finding IDs are one check now, because with
+  # every letter matched they are one pattern. An ID on its own is close to
+  # meaningless to an outsider, but it correlates a specific line of public
+  # code to a specific private entry, which is exactly the pairing the hygiene
+  # rule exists to prevent.
+  #
+  # The ID scan takes its own, narrower diff: CLAUDE.md and ROADMAP.md
+  # legitimately carry these shapes, while the secret and infra checks above
+  # must keep seeing every file without exception. Commit messages are scanned
+  # whole -- a message naming a tracker item is the leak this started as.
+  #
+  # Allowed tokens are subtracted FIRST and the remainder re-tested, so a line
+  # carrying both "Cardano L1" and a real ID still reports, and a line carrying
+  # only "CIP-68" does not.
+  DIFF_IDS=$(eval "git diff $RANGE -- . $ID_EXCLUDE" 2>/dev/null | grep '^+' | grep -v '^+++')
+  ID_HITS=$(printf '%s\n%s\n' "$DIFF_IDS" "$MSGS" \
+    | grep -nE "$ID_SHAPES" | sed -E "s#$ID_ALLOW##g" | grep -E "$ID_SHAPES" | head -5)
+  if [ -n "$ID_HITS" ]; then
+    echo "BLOCKED [internal ID - issue tracker or security-audit finding] in $RANGE:"
+    echo "$ID_HITS" | cut -c1-160
+    echo ""
+    FAIL=1
+  fi
+done
+
+# Everything above scans only the range being pushed, which is what lets a leak
+# already sitting in the tree stay invisible: it was pushed once, under whatever
+# patterns existed that day, and is never looked at again. The ID shapes are
+# therefore ALSO swept across the whole tracked tree, so the guarantee is about
+# the tree as it stands rather than about one range: what is tracked here today
+# carries no ID in any of these shapes that is not on the allowlist below.
+sweep() {
+  # $1 pattern, $2 the WHOLE pathspec after --, $3 an extra
+  # allowlist on top of ID_ALLOW, $4 the label to report under.
+  # -I skips binary files: a PNG whose bytes happen to contain a matching
+  # sequence would otherwise block every push forever.
+  hits=$(eval "git grep -nEI \"\$1\" -- $2" 2>/dev/null \
+    | sed -E "s#$ID_ALLOW##g" | sed -E "s#$3##g" | grep -E "$1" | head -5)
+  if [ -n "$hits" ]; then
+    echo "BLOCKED [$4 already in the tracked tree]:"
+    echo "$hits" | cut -c1-160
+    echo ""
+    FAIL=1
+  fi
+}
+
+# A pattern that cannot match subtracts nothing, which is how the general sweep
+# asks for no allowlist beyond ID_ALLOW.
+NEVER='\bZZZZ-NEVER-MATCHES-ZZZZ\b'
+
+sweep "$ID_SHAPES" ". $ID_EXCLUDE" "$NEVER" "internal ID"
+
+sweep "$ID_DASH" "CLAUDE.md ROADMAP.md" "$DOC_ALLOW" "security-audit finding ID"
+
+# The same standard for machine paths and hosting detail: the tree as it stands
+# carries none in any of these shapes, outside the hooks that define them.
+sweep "C:[\\\\/]+Users[\\\\/]+[A-Za-z]|/home/[A-Za-z0-9_-]+|/mnt/c/Users|AppData[\\\\/]+Local[\\\\/]+Temp" \
+  ". ':(exclude).githooks/'" "$NEVER" "local machine path"
+
+sweep "cpanel[[:space:]]*(user|password)|server[0-9]{2,4}\b|/home/[A-Za-z0-9_-]+/(public_html|lscache)" \
+  ". ':(exclude).githooks/'" "$NEVER" "live server / hosting detail"
+
+# And the literal terms with the hooks INCLUDED, because a hook file was the
+# one place a literal used to sit unexamined.
+if [ -n "$DENY_LITERALS" ]; then
+  sweep "$DENY_LITERALS" "." "$NEVER" "a term listed in local/hygiene-deny.txt"
+fi
+
+if [ "$FAIL" = "1" ]; then
+  cat <<'EOF'
+--------------------------------------------------------------------
+PUSH BLOCKED. This repository is PUBLIC — anything pushed must be
+treated as public permanently, even if deleted afterwards.
+
+Content that must never be pushed lives in gitignored local/ instead:
+  local/OPEN_ISSUES.md, local/FLAGGED_ISSUES.md,
+  local/SECURITY_AUDIT.md, local/CHANGELOG.md
+
+If a match is a genuine, reviewed false positive (not merely
+inconvenient), push with:  git push --no-verify
+--------------------------------------------------------------------
+EOF
+  exit 1
+fi
+
+# --------------------------------------------------------------------------
+# Lint/format gate — the same command the Checks workflow runs.
+#
+# Added 2026-08-02 after a push failed CI on Biome issues alone: the security
+# scan above passed, the code was correct and fully tested, and CI still went
+# red purely on import ordering and formatting. `biome ci .` covers the whole
+# repo in well under a second, so there is no reason to discover that on
+# GitHub instead of here.
+#
+# Runs AFTER the security scan on purpose — a leak is the hard failure and
+# should be reported first even when lint is also broken.
+# --------------------------------------------------------------------------
+
+if [ -f biome.json ] || [ -f biome.jsonc ]; then
+  if command -v npx >/dev/null 2>&1; then
+    echo "pre-push: running biome ci (same check as the Checks workflow)..."
+    BIOME_LOG=$(mktemp 2>/dev/null || echo "./.biome-prepush.log")
+
+    # A real biome run always prints "Checked N files", whether it passes or
+    # fails. Its absence means the binary never executed — which is a broken
+    # toolchain, not a lint result, and the two must not be conflated.
+    biome_actually_ran() {
+      grep -q "Checked [0-9]* file" "$1" 2>/dev/null
+    }
+
+    # The Windows biome binary is unsigned, and Smart App Control decides
+    # whether to run an unsigned executable from a cloud reputation verdict
+    # that can change without the file or any local setting changing — it did
+    # exactly that on 2026-09-02, mid-project, blocking every push. WSL is not
+    # subject to it, so the Linux build of the SAME pinned version is the
+    # fallback. This keeps the gate running rather than skipping it, and it
+    # recovers on its own if the verdict flips back.
+    run_biome_via_wsl() {
+      _log=$1
+      command -v wsl.exe >/dev/null 2>&1 || return 127
+      _winpwd=$(pwd -W 2>/dev/null) || return 127
+      [ -n "$_winpwd" ] || return 127
+      # Version comes from the installed package, so the fallback can never
+      # silently lint with a different biome than the one CI uses.
+      _ver=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' \
+        node_modules/@biomejs/biome/package.json 2>/dev/null | head -1)
+      [ -n "$_ver" ] || return 127
+      # Args are passed positionally: nesting quotes through `wsl.exe -e sh -c`
+      # is where this kind of shim usually breaks.
+      MSYS_NO_PATHCONV=1 wsl.exe -e sh -c '
+        ver=$1
+        winpwd=$2
+        if ! command -v node >/dev/null 2>&1; then
+          # nvm does not put node on a non-interactive PATH.
+          for d in "$HOME"/.nvm/versions/node/*/bin; do
+            [ -d "$d" ] && PATH="$d:$PATH"
+          done
+          export PATH
+        fi
+        command -v node >/dev/null 2>&1 || { echo "wsl fallback: no node in WSL"; exit 127; }
+        cache="$HOME/.cache/noctis-biome/$ver"
+        bin="$cache/node_modules/@biomejs/cli-linux-x64/biome"
+        if [ ! -x "$bin" ]; then
+          mkdir -p "$cache" || exit 127
+          cd "$cache" || exit 127
+          [ -f package.json ] || npm init -y >/dev/null 2>&1
+          npm install --silent --no-audit --no-fund "@biomejs/cli-linux-x64@$ver" >/dev/null 2>&1 \
+            || { echo "wsl fallback: could not install biome $ver in WSL"; exit 127; }
+          chmod +x "$bin" 2>/dev/null
+        fi
+        target=$(wslpath -a "$winpwd" 2>/dev/null) || { echo "wsl fallback: cannot translate $winpwd"; exit 127; }
+        cd "$target" || { echo "wsl fallback: cannot enter $target"; exit 127; }
+        exec "$bin" ci .
+      ' biome-fallback "$_ver" "$_winpwd" >"$_log" 2>&1
+    }
+
+    BIOME_ROUTE="windows"
+    if ! npx --no-install biome ci . >"$BIOME_LOG" 2>&1; then
+      BIOME_FAILED=1
+      if ! biome_actually_ran "$BIOME_LOG"; then
+        # It never ran. Either it is not installed, or something stopped the
+        # binary from executing at all.
+        if grep -qiE "could not determine executable|not found|npm ERR" "$BIOME_LOG"; then
+          echo "pre-push: WARNING — biome is not installed locally, skipping the lint gate."
+          echo "          Run 'npm install' so this check works; CI still enforces it."
+          BIOME_FAILED=0
+        else
+          echo "pre-push: the Windows biome binary would not execute; retrying under WSL..."
+          if run_biome_via_wsl "$BIOME_LOG" && biome_actually_ran "$BIOME_LOG"; then
+            echo "pre-push: biome ci passed (via WSL)."
+            BIOME_ROUTE="wsl"
+            BIOME_FAILED=0
+          elif biome_actually_ran "$BIOME_LOG"; then
+            # WSL ran it and it genuinely failed: that is a real lint failure.
+            BIOME_ROUTE="wsl"
+          else
+            echo ""
+            tail -20 "$BIOME_LOG"
+            cat <<'EOF'
+
+--------------------------------------------------------------------
+PUSH BLOCKED — the lint gate could not run at all.
+
+biome would not execute on Windows and the WSL fallback did not work
+either, so NOTHING checked this push. The Checks workflow still runs
+biome, so a lint problem would surface there instead.
+
+If Smart App Control is blocking node_modules\@biomejs\...\biome.exe,
+see Event Viewer > Applications and Services Logs > Microsoft >
+Windows > CodeIntegrity > Operational for the block record.
+
+Run the gate yourself before pushing, or fix the fallback.
+--------------------------------------------------------------------
+EOF
+            rm -f "$BIOME_LOG"
+            exit 1
+          fi
+        fi
+      fi
+
+      if [ "${BIOME_FAILED:-0}" = "1" ]; then
+        echo ""
+        tail -30 "$BIOME_LOG"
+        cat <<EOF
+
+--------------------------------------------------------------------
+PUSH BLOCKED — biome ci failed (route: $BIOME_ROUTE). The Checks
+workflow runs this exact command, so this push would go red on GitHub.
+
+Fix most of it automatically:   npx biome check --write .
+Some rules are "unsafe fixes" and must be applied by hand — biome
+prints the suggested replacement for those.
+
+To push anyway (rarely correct):  git push --no-verify
+--------------------------------------------------------------------
+EOF
+        rm -f "$BIOME_LOG"
+        exit 1
+      fi
+    fi
+    rm -f "$BIOME_LOG"
+  fi
+fi
+
+exit 0
